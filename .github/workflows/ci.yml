@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+          pip3 install flawfinder
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=all --inconclusive \
+            --suppress=missingIncludeSystem \
+            --std=c11 \
+            -I include/ \
+            --error-exitcode=0 \
+            *.c \
+            2>&1 | tee cppcheck-report.txt
+
+      - name: Run Flawfinder
+        run: |
+          flawfinder --minlevel=1 --error-level=5 \
+            *.c include/ | tee flawfinder-report.txt
+
+      - name: Upload analysis reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: static-analysis-reports
+          path: |
+            cppcheck-report.txt
+            flawfinder-report.txt
+
+  build-test:
+    name: Build Test (ESP-IDF ${{ matrix.idf-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        idf-version: ['v5.1.2', 'v5.2.1', 'latest']
+        idf-target: ['esp32', 'esp32s3', 'esp32c3']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create test project
+        run: |
+          mkdir -p test-project/main
+          mkdir -p test-project/components
+
+          # Create minimal main.c
+          cat > test-project/main/main.c << 'EOF'
+          #include <stdio.h>
+          #include "freertos/FreeRTOS.h"
+          #include "freertos/task.h"
+          #include "ld2410c.h"
+
+          void app_main(void) {
+              ld2410c_config_t config = {
+                  .uart_num = UART_NUM_1,
+                  .tx_pin = 17,
+                  .rx_pin = 18,
+                  .baud_rate = 256000,
+                  .max_move_gate = 8,
+                  .max_still_gate = 8,
+                  .timeout_seconds = 5,
+                  .engineering_mode = false
+              };
+
+              esp_err_t ret = ld2410c_init(&config);
+              if (ret == ESP_OK) {
+                  printf("LD2410C initialized successfully\n");
+              }
+
+              while (1) {
+                  vTaskDelay(pdMS_TO_TICKS(1000));
+              }
+          }
+          EOF
+
+          # Create main CMakeLists.txt
+          cat > test-project/main/CMakeLists.txt << 'EOF'
+          idf_component_register(SRCS "main.c"
+                                  INCLUDE_DIRS "."
+                                  REQUIRES ld2410c)
+          EOF
+
+          # Create project CMakeLists.txt
+          cat > test-project/CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+          project(ld2410c-test)
+          EOF
+
+          # Copy component
+          cp -r . test-project/components/ld2410c
+
+      - name: Install ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ matrix.idf-version }}
+          target: ${{ matrix.idf-target }}
+
+      - name: Build test project
+        working-directory: test-project
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target ${{ matrix.idf-target }}
+          idf.py build
+
+      - name: Check for warnings
+        working-directory: test-project
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py build 2>&1 | tee build-output.txt
+
+          # Count warnings in ld2410c component
+          WARNINGS=$(grep "warning:" build-output.txt | grep -c "ld2410c" || true)
+          echo "Found $WARNINGS warnings in ld2410c component"
+
+          if [ $WARNINGS -gt 0 ]; then
+            echo "::warning::Found $WARNINGS compiler warnings"
+            grep "warning:" build-output.txt | grep "ld2410c" || true
+          fi
