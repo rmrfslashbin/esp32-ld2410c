@@ -1,0 +1,5 @@
+# Mark PDFs as binary (don't show diffs)
+*.pdf binary
+
+# Mark Markdown as linguist documentation for GitHub stats
+*.md linguist-documentation

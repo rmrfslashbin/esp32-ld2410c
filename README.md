@@ -2,6 +2,9 @@
 
 Complete C implementation of the HLK-LD2410C human presence sensor driver for ESP-IDF.
 
+**Author:** Robert Sigler (code@sigler.io)
+**License:** MIT License
+
 ## Features
 
 - Full protocol implementation based on official specification V1.00
@@ -162,6 +165,68 @@ typedef struct {
 } ld2410c_data_t;
 ```
 
+## Configuration
+
+### Kconfig Options
+
+Configure the driver via `idf.py menuconfig` under "Component config" → "LD2410C Configuration":
+
+- `LD2410C_UART_BUF_SIZE` - UART buffer size (default: 1024 bytes)
+- `LD2410C_MAX_FRAME_SIZE` - Maximum frame size (default: 64 bytes)
+- `LD2410C_ACK_TIMEOUT_MS` - Command acknowledgment timeout (default: 500 ms)
+- `LD2410C_DEFAULT_BAUD_RATE` - Default baud rate (default: 256000)
+- `LD2410C_UART_TASK_STACK_SIZE` - UART task stack size (default: 4096 bytes)
+- `LD2410C_UART_TASK_PRIORITY` - UART task priority (default: 5)
+- `LD2410C_ENABLE_DEBUG_LOGS` - Enable verbose debug logging (default: disabled)
+
+### Default Configuration
+
+- Max detection gate: 8 (both moving and stationary)
+- Timeout: 5 seconds
+- Baud rate: 256000
+- Distance resolution: 0.75m per gate
+
+## Examples
+
+### Basic Example
+See `examples/basic/` for a complete working example showing:
+- Sensor initialization
+- Reading presence data
+- Connection monitoring
+
+### Engineering Mode Example
+See `examples/engineering_mode/` for advanced usage:
+- Per-gate energy readings
+- Sensitivity calibration
+- Detection zone configuration
+
+## Testing
+
+### Unit Tests
+```bash
+cd test
+idf.py build flash monitor
+```
+
+Run the test suite to verify:
+- Input validation
+- Error handling
+- API compliance
+
+See `test/README.md` for details.
+
+## Compliance
+
+This component follows ESP-IDF standards:
+- ✅ ESP-IDF coding style guide
+- ✅ Component structure requirements
+- ✅ Kconfig integration
+- ✅ Security best practices
+- ✅ Thread safety
+- ✅ Input validation
+
+See `CONTRIBUTING.md` for development guidelines.
+
 ## Troubleshooting
 
 ### Sensor not sending data (0 bytes received)
@@ -174,12 +239,31 @@ typedef struct {
 3. Power cycle the sensor
 4. The initialization sequence sends the correct commands to exit config mode
 
-### Default Configuration
+### Initialization fails with ESP_ERR_INVALID_ARG
 
-- Max detection gate: 8 (both moving and stationary)
-- Timeout: 5 seconds
-- Baud rate: 256000
-- Distance resolution: 0.75m per gate
+Check that:
+- UART port is valid (UART_NUM_0, UART_NUM_1, or UART_NUM_2)
+- GPIO pins are valid for your ESP32 variant
+- Baud rate is supported (9600, 19200, 38400, 57600, 115200, 230400, 256000, 460800)
+- Detection gates are in range 2-8
+
+### Compiler warnings
+
+The component is configured with strict warnings. All warnings must be fixed:
+```bash
+idf.py build
+# Should complete with no warnings from ld2410c component
+```
+
+### Memory issues
+
+Default configuration uses:
+- 1024 bytes UART RX buffer
+- 64 bytes frame buffer
+- 4096 bytes UART task stack
+- ~200 bytes for driver state
+
+Adjust via Kconfig if needed.
 
 ## Credits and Acknowledgments
 
@@ -213,6 +297,13 @@ This driver is based on and inspired by:
 ## License
 
 MIT License - Compatible with all referenced sources
+
+## Datasheets
+
+Official documentation is available in the `datasheets/` directory. See `datasheets/README.md` for:
+- Serial Communication Protocol V1.00
+- Product datasheet and specifications
+- Pin definitions and electrical characteristics
 
 ## References
 

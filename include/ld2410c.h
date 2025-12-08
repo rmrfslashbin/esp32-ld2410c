@@ -74,16 +74,44 @@ extern "C" {
 #define LD2410C_TARGET_STATIONARY     0x02
 #define LD2410C_TARGET_BOTH           0x03
 
-// Configuration Constants
+// Configuration Constants (can be overridden via Kconfig)
 #define LD2410C_MAX_GATES             9     // Gates 0-8
+
+#ifndef CONFIG_LD2410C_MAX_FRAME_SIZE
 #define LD2410C_MAX_FRAME_SIZE        64
+#else
+#define LD2410C_MAX_FRAME_SIZE        CONFIG_LD2410C_MAX_FRAME_SIZE
+#endif
+
+#ifndef CONFIG_LD2410C_UART_BUF_SIZE
 #define LD2410C_UART_BUF_SIZE         1024
+#else
+#define LD2410C_UART_BUF_SIZE         CONFIG_LD2410C_UART_BUF_SIZE
+#endif
+
+#ifndef CONFIG_LD2410C_ACK_TIMEOUT_MS
 #define LD2410C_ACK_TIMEOUT_MS        500
+#else
+#define LD2410C_ACK_TIMEOUT_MS        CONFIG_LD2410C_ACK_TIMEOUT_MS
+#endif
 
 // Default Configuration (from protocol spec Table 7)
+#ifndef CONFIG_LD2410C_DEFAULT_BAUD_RATE
 #define LD2410C_DEFAULT_BAUD          256000
+#else
+#define LD2410C_DEFAULT_BAUD          CONFIG_LD2410C_DEFAULT_BAUD_RATE
+#endif
+
 #define LD2410C_DEFAULT_MAX_GATE      8
 #define LD2410C_DEFAULT_TIMEOUT_SEC   5
+
+// Protocol parameter word identifiers (used in command values)
+#define LD2410C_PARAM_WORD_MAX_MOVE_DIST   0x0000
+#define LD2410C_PARAM_WORD_MAX_STILL_DIST  0x0001
+#define LD2410C_PARAM_WORD_TIMEOUT         0x0002
+#define LD2410C_PARAM_WORD_GATE_NUM        0x0000
+#define LD2410C_PARAM_WORD_MOVE_SENS       0x0001
+#define LD2410C_PARAM_WORD_STILL_SENS      0x0002
 
 /**
  * @brief Sensor data structure

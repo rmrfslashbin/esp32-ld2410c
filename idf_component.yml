@@ -1,0 +1,39 @@
+## IDF Component Manager Manifest File
+## See: https://docs.espressif.com/projects/idf-component-manager/en/latest/reference/manifest_file.html
+
+version: "1.0.0"
+description: "HLK-LD2410C 24GHz mmWave radar human presence sensor driver for ESP-IDF"
+url: "https://github.com/rmrfslashbin/are-you-there"
+repository: "https://github.com/rmrfslashbin/are-you-there"
+documentation: "https://github.com/rmrfslashbin/are-you-there/tree/main/firmware/components/ld2410c"
+
+dependencies:
+  idf:
+    version: ">=5.0"
+
+maintainers:
+  - "rmrfslashbin"
+
+license: "MIT"
+
+tags:
+  - sensor
+  - radar
+  - mmwave
+  - presence
+  - ld2410c
+  - uart
+
+files:
+  include:
+    - "**/*.h"
+    - "**/*.c"
+    - "CMakeLists.txt"
+    - "Kconfig"
+    - "README.md"
+    - "LICENSE"
+  exclude:
+    - ".git/**"
+    - ".github/**"
+    - "test/**"
+    - "examples/**"

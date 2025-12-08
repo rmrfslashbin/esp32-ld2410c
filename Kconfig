@@ -1,0 +1,62 @@
+menu "LD2410C Configuration"
+
+    config LD2410C_UART_BUF_SIZE
+        int "UART Buffer Size"
+        default 1024
+        range 256 4096
+        help
+            Size of the UART receive buffer in bytes.
+            Larger buffers can handle bursty data better but consume more RAM.
+            Default: 1024 bytes
+
+    config LD2410C_MAX_FRAME_SIZE
+        int "Maximum Frame Size"
+        default 64
+        range 32 128
+        help
+            Maximum size of a single protocol frame in bytes.
+            This should match the largest possible frame from the sensor.
+            Default: 64 bytes
+
+    config LD2410C_ACK_TIMEOUT_MS
+        int "Command ACK Timeout (ms)"
+        default 500
+        range 100 5000
+        help
+            Timeout in milliseconds to wait for command acknowledgment.
+            Increase if operating at very low baud rates.
+            Default: 500 ms
+
+    config LD2410C_DEFAULT_BAUD_RATE
+        int "Default Baud Rate"
+        default 256000
+        help
+            Default baud rate for sensor communication.
+            The sensor ships with 256000 baud by default.
+            Can be changed at runtime via configuration commands.
+
+    config LD2410C_UART_TASK_STACK_SIZE
+        int "UART Task Stack Size"
+        default 4096
+        range 2048 8192
+        help
+            Stack size for the UART receive task in bytes.
+            Default: 4096 bytes
+
+    config LD2410C_UART_TASK_PRIORITY
+        int "UART Task Priority"
+        default 5
+        range 1 25
+        help
+            FreeRTOS priority for the UART receive task.
+            Higher values = higher priority.
+            Default: 5 (medium priority)
+
+    config LD2410C_ENABLE_DEBUG_LOGS
+        bool "Enable Debug Logging"
+        default n
+        help
+            Enable verbose debug logging for protocol frame parsing.
+            Warning: This generates significant log output and may affect performance.
+
+endmenu

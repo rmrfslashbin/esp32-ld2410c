@@ -14,17 +14,17 @@
  * 5. Sensor continuously streams data frames with detection results
  */
 
-#include "ld2410c.h"
+#include <string.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include <string.h>
+#include "ld2410c.h"
 
 static const char *TAG = "ld2410c";
 
-// Global state
+// Driver state (static per ESP-IDF conventions)
 static struct {
     uart_port_t uart_num;
     ld2410c_data_t data;
@@ -41,7 +41,7 @@ static struct {
         FRAME_TYPE_DATA,
         FRAME_TYPE_CMD_ACK
     } frame_type;
-} g_ld2410c = {0};
+} s_ld2410c = {0};
 
 // Helper functions
 static inline uint16_t two_byte_to_int(uint8_t low, uint8_t high) {
@@ -86,6 +86,20 @@ static esp_err_t send_command(uint8_t cmd, const uint8_t *value, uint8_t value_l
     uint8_t frame[64];
     uint8_t pos = 0;
 
+    // Validate total frame size to prevent buffer overflow
+    // Total: 4 (header) + 2 (length) + 2 (command) + value_len + 4 (footer)
+    uint16_t total_len = 12 + value_len;
+    if (total_len > sizeof(frame)) {
+        ESP_LOGE(TAG, "Command frame too large: %d bytes (max %zu)", total_len, sizeof(frame));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Prevent integer overflow in length field
+    if (value_len > (UINT16_MAX - 2)) {
+        ESP_LOGE(TAG, "Command value too large: %d bytes", value_len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     // Header
     frame[pos++] = LD2410C_CMD_FRAME_HEADER_0;
     frame[pos++] = LD2410C_CMD_FRAME_HEADER_1;
@@ -114,14 +128,14 @@ static esp_err_t send_command(uint8_t cmd, const uint8_t *value, uint8_t value_l
     frame[pos++] = LD2410C_CMD_FRAME_FOOTER_3;
 
     // Send
-    int written = uart_write_bytes(g_ld2410c.uart_num, frame, pos);
+    int written = uart_write_bytes(s_ld2410c.uart_num, frame, pos);
     if (written != pos) {
         ESP_LOGW(TAG, "Failed to send command 0x%02X (wrote %d/%d bytes)", cmd, written, pos);
         return ESP_FAIL;
     }
 
     // Wait for TX to complete
-    uart_wait_tx_done(g_ld2410c.uart_num, pdMS_TO_TICKS(100));
+    uart_wait_tx_done(s_ld2410c.uart_num, pdMS_TO_TICKS(100));
 
     // Delay after command (except for config mode commands)
     if (cmd != LD2410C_CMD_ENABLE_CONF && cmd != LD2410C_CMD_DISABLE_CONF) {
@@ -192,38 +206,38 @@ static void parse_data_frame(const uint8_t *buf, uint8_t len) {
     // 14: stationary_energy
     // 15-16: detection_distance (little endian)
 
-    xSemaphoreTake(g_ld2410c.data_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_ld2410c.data_mutex, portMAX_DELAY);
 
     uint8_t target_state = buf[8];
-    g_ld2410c.data.presence_detected = (target_state != LD2410C_TARGET_NONE);
-    g_ld2410c.data.moving_target = (target_state & LD2410C_TARGET_MOVING) != 0;
-    g_ld2410c.data.stationary_target = (target_state & LD2410C_TARGET_STATIONARY) != 0;
+    s_ld2410c.data.presence_detected = (target_state != LD2410C_TARGET_NONE);
+    s_ld2410c.data.moving_target = (target_state & LD2410C_TARGET_MOVING) != 0;
+    s_ld2410c.data.stationary_target = (target_state & LD2410C_TARGET_STATIONARY) != 0;
 
-    g_ld2410c.data.moving_distance = two_byte_to_int(buf[9], buf[10]);
-    g_ld2410c.data.moving_energy = buf[11];
-    g_ld2410c.data.stationary_distance = two_byte_to_int(buf[12], buf[13]);
-    g_ld2410c.data.stationary_energy = buf[14];
-    g_ld2410c.data.detection_distance = two_byte_to_int(buf[15], buf[16]);
+    s_ld2410c.data.moving_distance = two_byte_to_int(buf[9], buf[10]);
+    s_ld2410c.data.moving_energy = buf[11];
+    s_ld2410c.data.stationary_distance = two_byte_to_int(buf[12], buf[13]);
+    s_ld2410c.data.stationary_energy = buf[14];
+    s_ld2410c.data.detection_distance = two_byte_to_int(buf[15], buf[16]);
 
     // Engineering mode: parse gate energies (Table 14 from protocol spec)
     if (engineering_mode && len >= 39) {
         // Offset 20-28: moving gate 0-8 energy (9 bytes)
         // Offset 29-37: stationary gate 0-8 energy (9 bytes)
         for (int i = 0; i < LD2410C_MAX_GATES; i++) {
-            g_ld2410c.data.gate_move_energy[i] = buf[20 + i];
-            g_ld2410c.data.gate_still_energy[i] = buf[29 + i];
+            s_ld2410c.data.gate_move_energy[i] = buf[20 + i];
+            s_ld2410c.data.gate_still_energy[i] = buf[29 + i];
         }
     }
 
-    g_ld2410c.data.last_update_time = esp_timer_get_time();
+    s_ld2410c.data.last_update_time = esp_timer_get_time();
 
-    xSemaphoreGive(g_ld2410c.data_mutex);
+    xSemaphoreGive(s_ld2410c.data_mutex);
 
     ESP_LOGD(TAG, "Data: presence=%d, moving=%dcm/%d, still=%dcm/%d, detect=%dcm",
-             g_ld2410c.data.presence_detected,
-             g_ld2410c.data.moving_distance, g_ld2410c.data.moving_energy,
-             g_ld2410c.data.stationary_distance, g_ld2410c.data.stationary_energy,
-             g_ld2410c.data.detection_distance);
+             s_ld2410c.data.presence_detected,
+             s_ld2410c.data.moving_distance, s_ld2410c.data.moving_energy,
+             s_ld2410c.data.stationary_distance, s_ld2410c.data.stationary_energy,
+             s_ld2410c.data.detection_distance);
 }
 
 /**
@@ -256,67 +270,67 @@ static void parse_ack_frame(const uint8_t *buf, uint8_t len) {
  * State machine to detect frame boundaries and parse frames.
  */
 static void process_byte(uint8_t byte) {
-    if (!g_ld2410c.in_frame) {
+    if (!s_ld2410c.in_frame) {
         // Look for frame header
-        if (g_ld2410c.buffer_pos == 0 &&
+        if (s_ld2410c.buffer_pos == 0 &&
             (byte == LD2410C_DATA_FRAME_HEADER_0 || byte == LD2410C_CMD_FRAME_HEADER_0)) {
-            g_ld2410c.buffer[g_ld2410c.buffer_pos++] = byte;
-        } else if (g_ld2410c.buffer_pos == 1 &&
+            s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
+        } else if (s_ld2410c.buffer_pos == 1 &&
                    (byte == LD2410C_DATA_FRAME_HEADER_1 || byte == LD2410C_CMD_FRAME_HEADER_1)) {
-            g_ld2410c.buffer[g_ld2410c.buffer_pos++] = byte;
-        } else if (g_ld2410c.buffer_pos == 2 &&
+            s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
+        } else if (s_ld2410c.buffer_pos == 2 &&
                    (byte == LD2410C_DATA_FRAME_HEADER_2 || byte == LD2410C_CMD_FRAME_HEADER_2)) {
-            g_ld2410c.buffer[g_ld2410c.buffer_pos++] = byte;
-        } else if (g_ld2410c.buffer_pos == 3 &&
+            s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
+        } else if (s_ld2410c.buffer_pos == 3 &&
                    (byte == LD2410C_DATA_FRAME_HEADER_3 || byte == LD2410C_CMD_FRAME_HEADER_3)) {
-            g_ld2410c.buffer[g_ld2410c.buffer_pos++] = byte;
-            g_ld2410c.in_frame = true;
+            s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
+            s_ld2410c.in_frame = true;
 
             // Detect frame type
-            if (g_ld2410c.buffer[0] == LD2410C_DATA_FRAME_HEADER_0) {
-                g_ld2410c.frame_type = FRAME_TYPE_DATA;
+            if (s_ld2410c.buffer[0] == LD2410C_DATA_FRAME_HEADER_0) {
+                s_ld2410c.frame_type = FRAME_TYPE_DATA;
             } else {
-                g_ld2410c.frame_type = FRAME_TYPE_CMD_ACK;
+                s_ld2410c.frame_type = FRAME_TYPE_CMD_ACK;
             }
         } else {
-            g_ld2410c.buffer_pos = 0;  // Reset on mismatch
+            s_ld2410c.buffer_pos = 0;  // Reset on mismatch
         }
     } else {
         // Inside frame - collect bytes
-        if (g_ld2410c.buffer_pos >= LD2410C_MAX_FRAME_SIZE) {
+        if (s_ld2410c.buffer_pos >= LD2410C_MAX_FRAME_SIZE) {
             ESP_LOGW(TAG, "Frame buffer overflow");
-            g_ld2410c.buffer_pos = 0;
-            g_ld2410c.in_frame = false;
+            s_ld2410c.buffer_pos = 0;
+            s_ld2410c.in_frame = false;
             return;
         }
 
-        g_ld2410c.buffer[g_ld2410c.buffer_pos++] = byte;
+        s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
 
         // Check if we have length bytes (position 4 and 5)
-        if (g_ld2410c.buffer_pos >= 6) {
-            uint16_t data_len = two_byte_to_int(g_ld2410c.buffer[4], g_ld2410c.buffer[5]);
+        if (s_ld2410c.buffer_pos >= 6) {
+            uint16_t data_len = two_byte_to_int(s_ld2410c.buffer[4], s_ld2410c.buffer[5]);
             uint16_t total_len = 4 + 2 + data_len + 4;  // header + length + data + footer
 
             // Sanity check
             if (total_len > LD2410C_MAX_FRAME_SIZE) {
                 ESP_LOGW(TAG, "Invalid frame length: %d", data_len);
-                g_ld2410c.buffer_pos = 0;
-                g_ld2410c.in_frame = false;
+                s_ld2410c.buffer_pos = 0;
+                s_ld2410c.in_frame = false;
                 return;
             }
 
             // Check if we have complete frame
-            if (g_ld2410c.buffer_pos >= total_len) {
+            if (s_ld2410c.buffer_pos >= total_len) {
                 // Parse frame based on type
-                if (g_ld2410c.frame_type == FRAME_TYPE_DATA) {
-                    parse_data_frame(g_ld2410c.buffer, g_ld2410c.buffer_pos);
+                if (s_ld2410c.frame_type == FRAME_TYPE_DATA) {
+                    parse_data_frame(s_ld2410c.buffer, s_ld2410c.buffer_pos);
                 } else {
-                    parse_ack_frame(g_ld2410c.buffer, g_ld2410c.buffer_pos);
+                    parse_ack_frame(s_ld2410c.buffer, s_ld2410c.buffer_pos);
                 }
 
                 // Reset for next frame
-                g_ld2410c.buffer_pos = 0;
-                g_ld2410c.in_frame = false;
+                s_ld2410c.buffer_pos = 0;
+                s_ld2410c.in_frame = false;
             }
         }
     }
@@ -339,7 +353,7 @@ static void uart_rx_task(void *arg) {
     uint32_t last_log_time = 0;
 
     while (1) {
-        int len = uart_read_bytes(g_ld2410c.uart_num, data, LD2410C_UART_BUF_SIZE, pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(s_ld2410c.uart_num, data, LD2410C_UART_BUF_SIZE, pdMS_TO_TICKS(100));
 
         if (len > 0) {
             total_bytes += len;
@@ -353,8 +367,8 @@ static void uart_rx_task(void *arg) {
         // Log status every 10 seconds
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
         if (now - last_log_time >= 10) {
-            int64_t time_since_update = (esp_timer_get_time() - g_ld2410c.data.last_update_time) / 1000000;
-            bool connected = (g_ld2410c.data.last_update_time > 0) && (time_since_update < 5);
+            int64_t time_since_update = (esp_timer_get_time() - s_ld2410c.data.last_update_time) / 1000000;
+            bool connected = (s_ld2410c.data.last_update_time > 0) && (time_since_update < 5);
             ESP_LOGI(TAG, "UART Status: %lu bytes received, Sensor: %s, Last update: %lld sec ago",
                      total_bytes, connected ? "CONNECTED" : "NOT CONNECTED", (long long)time_since_update);
             last_log_time = now;
@@ -372,9 +386,45 @@ esp_err_t ld2410c_init(const ld2410c_config_t *config) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (g_ld2410c.initialized) {
+    if (s_ld2410c.initialized) {
         ESP_LOGW(TAG, "Already initialized");
         return ESP_ERR_INVALID_STATE;
+    }
+
+    // Validate configuration parameters
+    if (config->uart_num >= UART_NUM_MAX) {
+        ESP_LOGE(TAG, "Invalid UART port: %d", config->uart_num);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (config->tx_pin >= GPIO_NUM_MAX || config->rx_pin >= GPIO_NUM_MAX) {
+        ESP_LOGE(TAG, "Invalid GPIO pins: TX=%d, RX=%d", config->tx_pin, config->rx_pin);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Validate detection gates (protocol spec: gates 0-8, but 2-8 for max detection)
+    if (config->max_move_gate < 2 || config->max_move_gate > 8) {
+        ESP_LOGE(TAG, "Invalid max_move_gate: %d (must be 2-8)", config->max_move_gate);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (config->max_still_gate < 2 || config->max_still_gate > 8) {
+        ESP_LOGE(TAG, "Invalid max_still_gate: %d (must be 2-8)", config->max_still_gate);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Validate baud rate (common rates supported by sensor)
+    const uint32_t valid_bauds[] = {9600, 19200, 38400, 57600, 115200, 230400, 256000, 460800};
+    bool baud_valid = false;
+    for (size_t i = 0; i < sizeof(valid_bauds) / sizeof(valid_bauds[0]); i++) {
+        if (config->baud_rate == valid_bauds[i]) {
+            baud_valid = true;
+            break;
+        }
+    }
+    if (!baud_valid) {
+        ESP_LOGE(TAG, "Invalid baud rate: %lu (use 256000 for default)", config->baud_rate);
+        return ESP_ERR_INVALID_ARG;
     }
 
     ESP_LOGI(TAG, "Initializing LD2410C driver");
@@ -382,8 +432,8 @@ esp_err_t ld2410c_init(const ld2410c_config_t *config) {
              config->tx_pin, config->rx_pin, config->baud_rate);
 
     // Create mutex
-    g_ld2410c.data_mutex = xSemaphoreCreateMutex();
-    if (g_ld2410c.data_mutex == NULL) {
+    s_ld2410c.data_mutex = xSemaphoreCreateMutex();
+    if (s_ld2410c.data_mutex == NULL) {
         ESP_LOGE(TAG, "Failed to create mutex");
         return ESP_ERR_NO_MEM;
     }
@@ -401,7 +451,7 @@ esp_err_t ld2410c_init(const ld2410c_config_t *config) {
     esp_err_t ret = uart_param_config(config->uart_num, &uart_config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "UART param config failed: %s", esp_err_to_name(ret));
-        vSemaphoreDelete(g_ld2410c.data_mutex);
+        vSemaphoreDelete(s_ld2410c.data_mutex);
         return ret;
     }
 
@@ -409,26 +459,39 @@ esp_err_t ld2410c_init(const ld2410c_config_t *config) {
                        UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "UART set pin failed: %s", esp_err_to_name(ret));
-        vSemaphoreDelete(g_ld2410c.data_mutex);
+        vSemaphoreDelete(s_ld2410c.data_mutex);
         return ret;
     }
 
     ret = uart_driver_install(config->uart_num, LD2410C_UART_BUF_SIZE * 2, 0, 0, NULL, 0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(ret));
-        vSemaphoreDelete(g_ld2410c.data_mutex);
+        vSemaphoreDelete(s_ld2410c.data_mutex);
         return ret;
     }
 
-    g_ld2410c.uart_num = config->uart_num;
+    s_ld2410c.uart_num = config->uart_num;
 
     // Create UART task
-    BaseType_t task_ret = xTaskCreate(uart_rx_task, "ld2410c_uart", 4096, NULL, 5,
-                                      &g_ld2410c.uart_task_handle);
+#ifndef CONFIG_LD2410C_UART_TASK_STACK_SIZE
+    #define UART_TASK_STACK_SIZE 4096
+#else
+    #define UART_TASK_STACK_SIZE CONFIG_LD2410C_UART_TASK_STACK_SIZE
+#endif
+
+#ifndef CONFIG_LD2410C_UART_TASK_PRIORITY
+    #define UART_TASK_PRIORITY 5
+#else
+    #define UART_TASK_PRIORITY CONFIG_LD2410C_UART_TASK_PRIORITY
+#endif
+
+    BaseType_t task_ret = xTaskCreate(uart_rx_task, "ld2410c_uart",
+                                      UART_TASK_STACK_SIZE, NULL, UART_TASK_PRIORITY,
+                                      &s_ld2410c.uart_task_handle);
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create UART task");
         uart_driver_delete(config->uart_num);
-        vSemaphoreDelete(g_ld2410c.data_mutex);
+        vSemaphoreDelete(s_ld2410c.data_mutex);
         return ESP_FAIL;
     }
 
@@ -451,67 +514,79 @@ esp_err_t ld2410c_init(const ld2410c_config_t *config) {
 
     vTaskDelay(pdMS_TO_TICKS(200));  // Wait for streaming to start
 
-    g_ld2410c.initialized = true;
+    s_ld2410c.initialized = true;
     ESP_LOGI(TAG, "LD2410C driver initialized successfully");
 
     return ESP_OK;
 }
 
 esp_err_t ld2410c_deinit(void) {
-    if (!g_ld2410c.initialized) {
+    if (!s_ld2410c.initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (g_ld2410c.uart_task_handle != NULL) {
-        vTaskDelete(g_ld2410c.uart_task_handle);
-        g_ld2410c.uart_task_handle = NULL;
+    if (s_ld2410c.uart_task_handle != NULL) {
+        vTaskDelete(s_ld2410c.uart_task_handle);
+        s_ld2410c.uart_task_handle = NULL;
     }
 
-    uart_driver_delete(g_ld2410c.uart_num);
+    uart_driver_delete(s_ld2410c.uart_num);
 
-    if (g_ld2410c.data_mutex != NULL) {
-        vSemaphoreDelete(g_ld2410c.data_mutex);
-        g_ld2410c.data_mutex = NULL;
+    if (s_ld2410c.data_mutex != NULL) {
+        vSemaphoreDelete(s_ld2410c.data_mutex);
+        s_ld2410c.data_mutex = NULL;
     }
 
-    memset(&g_ld2410c, 0, sizeof(g_ld2410c));
+    memset(&s_ld2410c, 0, sizeof(s_ld2410c));
 
     ESP_LOGI(TAG, "LD2410C driver deinitialized");
     return ESP_OK;
 }
 
 esp_err_t ld2410c_get_data(ld2410c_data_t *data) {
-    if (data == NULL || !g_ld2410c.initialized) {
+    if (data == NULL || !s_ld2410c.initialized) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    xSemaphoreTake(g_ld2410c.data_mutex, portMAX_DELAY);
-    memcpy(data, &g_ld2410c.data, sizeof(ld2410c_data_t));
-    xSemaphoreGive(g_ld2410c.data_mutex);
+    if (s_ld2410c.data_mutex == NULL) {
+        ESP_LOGE(TAG, "Mutex not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_ld2410c.data_mutex, portMAX_DELAY);
+    memcpy(data, &s_ld2410c.data, sizeof(ld2410c_data_t));
+    xSemaphoreGive(s_ld2410c.data_mutex);
 
     return ESP_OK;
 }
 
 bool ld2410c_is_connected(uint8_t timeout_sec) {
-    if (!g_ld2410c.initialized) {
+    if (!s_ld2410c.initialized) {
         return false;
     }
 
-    if (g_ld2410c.data.last_update_time == 0) {
+    // Thread-safe read of last_update_time
+    xSemaphoreTake(s_ld2410c.data_mutex, portMAX_DELAY);
+    int64_t last_update = s_ld2410c.data.last_update_time;
+    xSemaphoreGive(s_ld2410c.data_mutex);
+
+    if (last_update == 0) {
         return false;
     }
 
-    int64_t time_since_update = (esp_timer_get_time() - g_ld2410c.data.last_update_time) / 1000000;
+    int64_t time_since_update = (esp_timer_get_time() - last_update) / 1000000;
     return time_since_update < timeout_sec;
 }
 
 esp_err_t ld2410c_set_engineering_mode(bool enable) {
-    if (!g_ld2410c.initialized) {
+    if (!s_ld2410c.initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
     esp_err_t ret = set_config_mode(true);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -520,7 +595,11 @@ esp_err_t ld2410c_set_engineering_mode(bool enable) {
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    set_config_mode(false);
+    esp_err_t exit_ret = set_config_mode(false);
+    if (ret == ESP_OK && exit_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Command succeeded but failed to exit config mode");
+        return exit_ret;
+    }
 
     return ret;
 }
@@ -528,8 +607,18 @@ esp_err_t ld2410c_set_engineering_mode(bool enable) {
 esp_err_t ld2410c_set_max_distances_timeout(uint8_t max_move_gate,
                                               uint8_t max_still_gate,
                                               uint16_t timeout_sec) {
-    if (!g_ld2410c.initialized) {
+    if (!s_ld2410c.initialized) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    // Validate parameters
+    if (max_move_gate < 2 || max_move_gate > 8) {
+        ESP_LOGE(TAG, "Invalid max_move_gate: %d (must be 2-8)", max_move_gate);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (max_still_gate < 2 || max_still_gate > 8) {
+        ESP_LOGE(TAG, "Invalid max_still_gate: %d (must be 2-8)", max_still_gate);
+        return ESP_ERR_INVALID_ARG;
     }
 
     // Build command value (from protocol spec 2.2.3)
@@ -548,7 +637,9 @@ esp_err_t ld2410c_set_max_distances_timeout(uint8_t max_move_gate,
     value[16] = 0x00;  value[17] = 0x00;
 
     esp_err_t ret = set_config_mode(true);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -556,7 +647,11 @@ esp_err_t ld2410c_set_max_distances_timeout(uint8_t max_move_gate,
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    set_config_mode(false);
+    esp_err_t exit_ret = set_config_mode(false);
+    if (ret == ESP_OK && exit_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Command succeeded but failed to exit config mode");
+        return exit_ret;
+    }
 
     return ret;
 }
@@ -564,7 +659,18 @@ esp_err_t ld2410c_set_max_distances_timeout(uint8_t max_move_gate,
 esp_err_t ld2410c_set_gate_sensitivity(uint8_t gate,
                                         uint8_t move_sensitivity,
                                         uint8_t still_sensitivity) {
-    if (!g_ld2410c.initialized || gate >= LD2410C_MAX_GATES) {
+    if (!s_ld2410c.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Validate parameters
+    if (gate >= LD2410C_MAX_GATES) {
+        ESP_LOGE(TAG, "Invalid gate: %d (must be 0-%d)", gate, LD2410C_MAX_GATES - 1);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (move_sensitivity > 100 || still_sensitivity > 100) {
+        ESP_LOGE(TAG, "Invalid sensitivity values (must be 0-100)");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -583,7 +689,9 @@ esp_err_t ld2410c_set_gate_sensitivity(uint8_t gate,
     value[15] = 0x00;  value[16] = 0x00;  value[17] = 0x00;
 
     esp_err_t ret = set_config_mode(true);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -591,14 +699,18 @@ esp_err_t ld2410c_set_gate_sensitivity(uint8_t gate,
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    set_config_mode(false);
+    esp_err_t exit_ret = set_config_mode(false);
+    if (ret == ESP_OK && exit_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Command succeeded but failed to exit config mode");
+        return exit_ret;
+    }
 
     return ret;
 }
 
 esp_err_t ld2410c_get_version(char *version, size_t version_size) {
     // TODO: Implement version reading with ACK parsing
-    if (version == NULL || !g_ld2410c.initialized) {
+    if (version == NULL || !s_ld2410c.initialized) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -607,7 +719,7 @@ esp_err_t ld2410c_get_version(char *version, size_t version_size) {
 }
 
 esp_err_t ld2410c_restart(void) {
-    if (!g_ld2410c.initialized) {
+    if (!s_ld2410c.initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -624,12 +736,14 @@ esp_err_t ld2410c_restart(void) {
 }
 
 esp_err_t ld2410c_factory_reset(void) {
-    if (!g_ld2410c.initialized) {
+    if (!s_ld2410c.initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
     esp_err_t ret = set_config_mode(true);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -637,7 +751,11 @@ esp_err_t ld2410c_factory_reset(void) {
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    set_config_mode(false);
+    esp_err_t exit_ret = set_config_mode(false);
+    if (ret == ESP_OK && exit_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Reset succeeded but failed to exit config mode");
+        return exit_ret;
+    }
 
     return ret;
 }
