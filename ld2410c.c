@@ -41,6 +41,13 @@ static struct {
         FRAME_TYPE_DATA,
         FRAME_TYPE_CMD_ACK
     } frame_type;
+
+    // ACK waiting state
+    SemaphoreHandle_t ack_semaphore;
+    uint8_t ack_buffer[LD2410C_MAX_FRAME_SIZE];
+    uint8_t ack_length;
+    uint8_t expected_ack_cmd;
+    bool waiting_for_ack;
 } s_ld2410c = {0};
 
 // Helper functions
@@ -77,12 +84,21 @@ static bool validate_footer(const uint8_t *buf, bool is_data_frame) {
 }
 
 /**
- * @brief Send command to sensor
+ * @brief Send command to sensor with optional ACK waiting
  *
  * Frame format:
  * [Header 4B] [Length 2B] [Command 2B] [Value NB] [Footer 4B]
+ *
+ * @param cmd Command byte
+ * @param value Command value data
+ * @param value_len Length of value data
+ * @param wait_ack If true, wait for ACK response
+ * @param ack_data Buffer to store ACK payload (optional, can be NULL)
+ * @param ack_len Pointer to store ACK payload length (optional, can be NULL)
+ * @return esp_err_t ESP_OK on success
  */
-static esp_err_t send_command(uint8_t cmd, const uint8_t *value, uint8_t value_len) {
+static esp_err_t send_command(uint8_t cmd, const uint8_t *value, uint8_t value_len,
+                               bool wait_ack, uint8_t *ack_data, size_t *ack_len) {
     uint8_t frame[64];
     uint8_t pos = 0;
 
@@ -92,6 +108,21 @@ static esp_err_t send_command(uint8_t cmd, const uint8_t *value, uint8_t value_l
     if (total_len > sizeof(frame)) {
         ESP_LOGE(TAG, "Command frame too large: %d bytes (max %zu)", total_len, sizeof(frame));
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    // If waiting for ACK, prepare ACK state
+    if (wait_ack) {
+        if (s_ld2410c.ack_semaphore == NULL) {
+            ESP_LOGE(TAG, "ACK semaphore not initialized");
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        // Clear any pending ACK
+        xSemaphoreTake(s_ld2410c.ack_semaphore, 0);
+
+        s_ld2410c.waiting_for_ack = true;
+        s_ld2410c.expected_ack_cmd = cmd;
+        s_ld2410c.ack_length = 0;
     }
 
     // Header
@@ -126,18 +157,52 @@ static esp_err_t send_command(uint8_t cmd, const uint8_t *value, uint8_t value_l
     int written = uart_write_bytes(s_ld2410c.uart_num, frame, pos);
     if (written != pos) {
         ESP_LOGW(TAG, "Failed to send command 0x%02X (wrote %d/%d bytes)", cmd, written, pos);
+        s_ld2410c.waiting_for_ack = false;
         return ESP_FAIL;
     }
 
     // Wait for TX to complete
     uart_wait_tx_done(s_ld2410c.uart_num, pdMS_TO_TICKS(100));
 
+    ESP_LOGD(TAG, "Sent command 0x%02X (%d bytes)", cmd, pos);
+
+    // Wait for ACK if requested
+    if (wait_ack) {
+        if (xSemaphoreTake(s_ld2410c.ack_semaphore, pdMS_TO_TICKS(LD2410C_ACK_TIMEOUT_MS)) == pdTRUE) {
+            ESP_LOGD(TAG, "Received ACK for command 0x%02X", cmd);
+
+            // Copy ACK data if buffer provided
+            if (ack_data != NULL && ack_len != NULL) {
+                // ACK payload starts after: header(4) + length(2) + cmd(1) + status(1) = offset 8
+                if (s_ld2410c.ack_length > 8) {
+                    *ack_len = s_ld2410c.ack_length - 8 - 4; // Subtract header + footer
+                    memcpy(ack_data, &s_ld2410c.ack_buffer[8], *ack_len);
+                } else {
+                    *ack_len = 0;
+                }
+            }
+
+            // Check ACK status
+            if (s_ld2410c.ack_buffer[7] != 0x00) {
+                ESP_LOGW(TAG, "Command 0x%02X failed: status=0x%02X", cmd, s_ld2410c.ack_buffer[7]);
+                s_ld2410c.waiting_for_ack = false;
+                return ESP_FAIL;
+            }
+
+            s_ld2410c.waiting_for_ack = false;
+            return ESP_OK;
+        } else {
+            ESP_LOGW(TAG, "Timeout waiting for ACK for command 0x%02X", cmd);
+            s_ld2410c.waiting_for_ack = false;
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
     // Delay after command (except for config mode commands)
     if (cmd != LD2410C_CMD_ENABLE_CONF && cmd != LD2410C_CMD_DISABLE_CONF) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    ESP_LOGD(TAG, "Sent command 0x%02X (%d bytes)", cmd, pos);
     return ESP_OK;
 }
 
@@ -150,10 +215,10 @@ static esp_err_t set_config_mode(bool enable) {
 
     if (enable) {
         ESP_LOGI(TAG, "Enabling configuration mode...");
-        return send_command(cmd, value, sizeof(value));
+        return send_command(cmd, value, sizeof(value), true, NULL, NULL);
     } else {
         ESP_LOGI(TAG, "Disabling configuration mode (starting data stream)...");
-        return send_command(cmd, NULL, 0);
+        return send_command(cmd, NULL, 0, true, NULL, NULL);
     }
 }
 
@@ -256,6 +321,13 @@ static void parse_ack_frame(const uint8_t *buf, uint8_t len) {
         ESP_LOGD(TAG, "ACK for command 0x%02X: SUCCESS", cmd);
     } else {
         ESP_LOGW(TAG, "ACK for command 0x%02X: FAILED (status=0x%02X)", cmd, status);
+    }
+
+    // If waiting for this ACK, save it and signal
+    if (s_ld2410c.waiting_for_ack && cmd == s_ld2410c.expected_ack_cmd) {
+        s_ld2410c.ack_length = (len < LD2410C_MAX_FRAME_SIZE) ? len : LD2410C_MAX_FRAME_SIZE;
+        memcpy(s_ld2410c.ack_buffer, buf, s_ld2410c.ack_length);
+        xSemaphoreGive(s_ld2410c.ack_semaphore);
     }
 }
 
@@ -429,7 +501,15 @@ esp_err_t ld2410c_init(const ld2410c_config_t *config) {
     // Create mutex
     s_ld2410c.data_mutex = xSemaphoreCreateMutex();
     if (s_ld2410c.data_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create mutex");
+        ESP_LOGE(TAG, "Failed to create data mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Create ACK semaphore
+    s_ld2410c.ack_semaphore = xSemaphoreCreateBinary();
+    if (s_ld2410c.ack_semaphore == NULL) {
+        ESP_LOGE(TAG, "Failed to create ACK semaphore");
+        vSemaphoreDelete(s_ld2410c.data_mutex);
         return ESP_ERR_NO_MEM;
     }
 
@@ -532,6 +612,11 @@ esp_err_t ld2410c_deinit(void) {
         s_ld2410c.data_mutex = NULL;
     }
 
+    if (s_ld2410c.ack_semaphore != NULL) {
+        vSemaphoreDelete(s_ld2410c.ack_semaphore);
+        s_ld2410c.ack_semaphore = NULL;
+    }
+
     memset(&s_ld2410c, 0, sizeof(s_ld2410c));
 
     ESP_LOGI(TAG, "LD2410C driver deinitialized");
@@ -586,7 +671,7 @@ esp_err_t ld2410c_set_engineering_mode(bool enable) {
     vTaskDelay(pdMS_TO_TICKS(100));
 
     uint8_t cmd = enable ? LD2410C_CMD_ENABLE_ENG : LD2410C_CMD_DISABLE_ENG;
-    ret = send_command(cmd, NULL, 0);
+    ret = send_command(cmd, NULL, 0, true, NULL, NULL);
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -638,7 +723,7 @@ esp_err_t ld2410c_set_max_distances_timeout(uint8_t max_move_gate,
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ret = send_command(LD2410C_CMD_MAXDIST_DURATION, value, sizeof(value));
+    ret = send_command(LD2410C_CMD_MAXDIST_DURATION, value, sizeof(value), true, NULL, NULL);
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -690,7 +775,7 @@ esp_err_t ld2410c_set_gate_sensitivity(uint8_t gate,
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ret = send_command(LD2410C_CMD_GATE_SENS, value, sizeof(value));
+    ret = send_command(LD2410C_CMD_GATE_SENS, value, sizeof(value), true, NULL, NULL);
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -703,14 +788,238 @@ esp_err_t ld2410c_set_gate_sensitivity(uint8_t gate,
     return ret;
 }
 
+esp_err_t ld2410c_query_version(ld2410c_version_t *version) {
+    if (!s_ld2410c.initialized || version == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t ack_data[32];
+    size_t ack_len = 0;
+
+    esp_err_t ret = send_command(LD2410C_CMD_QUERY_VERSION, NULL, 0, true, ack_data, &ack_len);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // ACK payload format: [12 bytes version data]
+    // Byte 0: type
+    // Byte 1: major
+    // Byte 2: minor
+    // Bytes 3-6: version code (little endian)
+    if (ack_len < 12) {
+        ESP_LOGW(TAG, "Version ACK too short: %zu bytes", ack_len);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    version->type = ack_data[0];
+    version->major = ack_data[1];
+    version->minor = ack_data[2];
+    version->code = (uint32_t)ack_data[3] | ((uint32_t)ack_data[4] << 8) |
+                    ((uint32_t)ack_data[5] << 16) | ((uint32_t)ack_data[6] << 24);
+
+    return ESP_OK;
+}
+
+esp_err_t ld2410c_query_mac(uint8_t mac[6]) {
+    if (!s_ld2410c.initialized || mac == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t ack_data[32];
+    size_t ack_len = 0;
+    const uint8_t value[] = {0x01, 0x00};
+
+    esp_err_t ret = send_command(LD2410C_CMD_QUERY_MAC, value, sizeof(value), true, ack_data, &ack_len);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // ACK payload format: [6 bytes MAC address]
+    if (ack_len < 6) {
+        ESP_LOGW(TAG, "MAC ACK too short: %zu bytes", ack_len);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    memcpy(mac, ack_data, 6);
+    return ESP_OK;
+}
+
+esp_err_t ld2410c_query_distance_resolution(ld2410c_resolution_t *resolution) {
+    if (!s_ld2410c.initialized || resolution == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t ack_data[32];
+    size_t ack_len = 0;
+
+    esp_err_t ret = send_command(LD2410C_CMD_QUERY_DIST_RES, NULL, 0, true, ack_data, &ack_len);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // ACK payload format: [2 bytes resolution value, little endian]
+    if (ack_len < 2) {
+        ESP_LOGW(TAG, "Resolution ACK too short: %zu bytes", ack_len);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    uint16_t res_value = (uint16_t)ack_data[0] | ((uint16_t)ack_data[1] << 8);
+    *resolution = (ld2410c_resolution_t)res_value;
+
+    return ESP_OK;
+}
+
+esp_err_t ld2410c_query_parameters(ld2410c_parameters_t *params) {
+    if (!s_ld2410c.initialized || params == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t ack_data[64];
+    size_t ack_len = 0;
+
+    esp_err_t ret = send_command(LD2410C_CMD_QUERY, NULL, 0, true, ack_data, &ack_len);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // ACK payload format (28 bytes total):
+    // Byte 0: max move gate
+    // Byte 1: max still gate
+    // Bytes 2-3: timeout (little endian, uint16)
+    // Bytes 4-12: move sensitivity for gates 0-8 (9 bytes)
+    // Bytes 13-21: still sensitivity for gates 0-8 (9 bytes)
+    if (ack_len < 22) {
+        ESP_LOGW(TAG, "Parameters ACK too short: %zu bytes (expected >=22)", ack_len);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    params->max_move_gate = ack_data[0];
+    params->max_still_gate = ack_data[1];
+    params->timeout_sec = (uint16_t)ack_data[2] | ((uint16_t)ack_data[3] << 8);
+
+    for (int i = 0; i < LD2410C_MAX_GATES; i++) {
+        params->move_sensitivity[i] = ack_data[4 + i];
+        params->still_sensitivity[i] = ack_data[13 + i];
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t ld2410c_read_all_info(void) {
+    if (!s_ld2410c.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "Reading sensor information...");
+    ESP_LOGI(TAG, "========================================");
+
+    esp_err_t ret;
+
+    // Enter config mode
+    ESP_LOGI(TAG, "Entering config mode...");
+    ret = set_config_mode(true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enter config mode");
+        return ret;
+    }
+    ESP_LOGI(TAG, "\xE2\x9C\x93 Config mode enabled");  // ✓ symbol
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Query firmware version
+    ld2410c_version_t version = {0};
+    ret = ld2410c_query_version(&version);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "\xE2\x9C\x93 Firmware: V%d.%02d (Type %d, Code %08lX)",
+                 version.major, version.minor, version.type, version.code);
+    } else {
+        ESP_LOGW(TAG, "\xE2\x9A\xA0 Failed to query firmware version");  // ⚠ symbol
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Query MAC address
+    uint8_t mac[6] = {0};
+    ret = ld2410c_query_mac(mac);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "\xE2\x9C\x93 MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        ESP_LOGW(TAG, "\xE2\x9A\xA0 Failed to query MAC address");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Query distance resolution
+    ld2410c_resolution_t resolution = LD2410C_RES_0_75M;
+    ret = ld2410c_query_distance_resolution(&resolution);
+    if (ret == ESP_OK) {
+        const char *res_str = (resolution == LD2410C_RES_0_2M) ? "0.2m" : "0.75m";
+        ESP_LOGI(TAG, "\xE2\x9C\x93 Distance resolution: %s per gate", res_str);
+    } else {
+        ESP_LOGW(TAG, "\xE2\x9A\xA0 Failed to query distance resolution");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Query current parameters
+    ld2410c_parameters_t params = {0};
+    ret = ld2410c_query_parameters(&params);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "\xE2\x9C\x93 Configuration:");
+        ESP_LOGI(TAG, "  - Max move gate: %d", params.max_move_gate);
+        ESP_LOGI(TAG, "  - Max still gate: %d", params.max_still_gate);
+        ESP_LOGI(TAG, "  - Timeout: %d seconds", params.timeout_sec);
+        ESP_LOGI(TAG, "  - Move sensitivities: [%d,%d,%d,%d,%d,%d,%d,%d,%d]",
+                 params.move_sensitivity[0], params.move_sensitivity[1],
+                 params.move_sensitivity[2], params.move_sensitivity[3],
+                 params.move_sensitivity[4], params.move_sensitivity[5],
+                 params.move_sensitivity[6], params.move_sensitivity[7],
+                 params.move_sensitivity[8]);
+        ESP_LOGI(TAG, "  - Still sensitivities: [%d,%d,%d,%d,%d,%d,%d,%d,%d]",
+                 params.still_sensitivity[0], params.still_sensitivity[1],
+                 params.still_sensitivity[2], params.still_sensitivity[3],
+                 params.still_sensitivity[4], params.still_sensitivity[5],
+                 params.still_sensitivity[6], params.still_sensitivity[7],
+                 params.still_sensitivity[8]);
+    } else {
+        ESP_LOGW(TAG, "\xE2\x9A\xA0 Failed to query parameters");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Exit config mode
+    ESP_LOGI(TAG, "Exiting config mode...");
+    ret = set_config_mode(false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to exit config mode");
+        return ret;
+    }
+    ESP_LOGI(TAG, "\xE2\x9C\x93 Config mode disabled, sensor streaming");
+
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "Sensor information query complete");
+    ESP_LOGI(TAG, "========================================");
+
+    return ESP_OK;
+}
+
 esp_err_t ld2410c_get_version(char *version, size_t version_size) {
-    // TODO: Implement version reading with ACK parsing
+    // Deprecated - kept for backwards compatibility
     if (version == NULL || !s_ld2410c.initialized) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    ld2410c_version_t ver;
+    esp_err_t ret = ld2410c_query_version(&ver);
+    if (ret == ESP_OK) {
+        snprintf(version, version_size, "V%d.%02d.%08lX", ver.major, ver.minor, ver.code);
+        return ESP_OK;
+    }
+
     snprintf(version, version_size, "Unknown");
-    return ESP_ERR_NOT_SUPPORTED;
+    return ret;
 }
 
 esp_err_t ld2410c_restart(void) {
@@ -723,7 +1032,7 @@ esp_err_t ld2410c_restart(void) {
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ret = send_command(LD2410C_CMD_RESTART, NULL, 0);
+    ret = send_command(LD2410C_CMD_RESTART, NULL, 0, false, NULL, NULL);
 
     vTaskDelay(pdMS_TO_TICKS(2000));  // Wait for restart
 
@@ -742,7 +1051,7 @@ esp_err_t ld2410c_factory_reset(void) {
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ret = send_command(LD2410C_CMD_RESET, NULL, 0);
+    ret = send_command(LD2410C_CMD_RESET, NULL, 0, true, NULL, NULL);
 
     vTaskDelay(pdMS_TO_TICKS(100));
 

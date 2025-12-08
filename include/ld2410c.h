@@ -223,12 +223,96 @@ esp_err_t ld2410c_set_gate_sensitivity(uint8_t gate,
                                         uint8_t still_sensitivity);
 
 /**
- * @brief Read firmware version
+ * @brief Firmware version structure
+ */
+typedef struct {
+    uint8_t type;      // Firmware type
+    uint8_t major;     // Major version
+    uint8_t minor;     // Minor version
+    uint32_t code;     // Version code
+} ld2410c_version_t;
+
+/**
+ * @brief Distance resolution enumeration
+ */
+typedef enum {
+    LD2410C_RES_0_2M = 0x0001,  // 0.2m per gate (0-1.8m range)
+    LD2410C_RES_0_75M = 0x0002  // 0.75m per gate (0-6.75m range, default)
+} ld2410c_resolution_t;
+
+/**
+ * @brief Sensor parameters structure
+ */
+typedef struct {
+    uint8_t max_move_gate;
+    uint8_t max_still_gate;
+    uint16_t timeout_sec;
+    uint8_t move_sensitivity[LD2410C_MAX_GATES];
+    uint8_t still_sensitivity[LD2410C_MAX_GATES];
+} ld2410c_parameters_t;
+
+/**
+ * @brief Read firmware version (deprecated - use ld2410c_query_version)
  *
  * @param version Buffer to store version string (min 20 bytes)
  * @return esp_err_t ESP_OK on success
  */
 esp_err_t ld2410c_get_version(char *version, size_t version_size);
+
+/**
+ * @brief Query firmware version from sensor
+ *
+ * Must be called after entering config mode.
+ *
+ * @param version Pointer to version structure to fill
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t ld2410c_query_version(ld2410c_version_t *version);
+
+/**
+ * @brief Query MAC address from sensor
+ *
+ * Must be called after entering config mode.
+ *
+ * @param mac Buffer to store 6-byte MAC address
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t ld2410c_query_mac(uint8_t mac[6]);
+
+/**
+ * @brief Query distance resolution from sensor
+ *
+ * Must be called after entering config mode.
+ *
+ * @param resolution Pointer to store resolution value
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t ld2410c_query_distance_resolution(ld2410c_resolution_t *resolution);
+
+/**
+ * @brief Query current parameters from sensor
+ *
+ * Must be called after entering config mode.
+ *
+ * @param params Pointer to parameters structure to fill
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t ld2410c_query_parameters(ld2410c_parameters_t *params);
+
+/**
+ * @brief Read all sensor information (ESPHome-style diagnostic query)
+ *
+ * This performs a comprehensive diagnostic query that:
+ * - Enters config mode
+ * - Queries firmware version, MAC address, distance resolution, and parameters
+ * - Exits config mode
+ * - Logs all information
+ *
+ * This is useful during initialization to verify sensor connectivity and configuration.
+ *
+ * @return esp_err_t ESP_OK if all queries succeeded
+ */
+esp_err_t ld2410c_read_all_info(void);
 
 /**
  * @brief Restart the sensor module
