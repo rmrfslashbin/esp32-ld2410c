@@ -114,27 +114,4 @@ jobs:
         with:
           esp_idf_version: ${{ matrix.idf-version }}
           target: ${{ matrix.idf-target }}
-
-      - name: Build test project
-        working-directory: test-project
-        shell: bash
-        run: |
-          . $IDF_PATH/export.sh
-          idf.py set-target ${{ matrix.idf-target }}
-          idf.py build
-
-      - name: Check for warnings
-        working-directory: test-project
-        shell: bash
-        run: |
-          . $IDF_PATH/export.sh
-          idf.py build 2>&1 | tee build-output.txt
-
-          # Count warnings in ld2410c component
-          WARNINGS=$(grep "warning:" build-output.txt | grep -c "ld2410c" || true)
-          echo "Found $WARNINGS warnings in ld2410c component"
-
-          if [ $WARNINGS -gt 0 ]; then
-            echo "::warning::Found $WARNINGS compiler warnings"
-            grep "warning:" build-output.txt | grep "ld2410c" || true
-          fi
+          path: 'test-project'
