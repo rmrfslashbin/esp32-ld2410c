@@ -1,7 +1,16 @@
+# ESP-IDF v6.1+ split UART driver into separate component
+# For v5.x: UART is in 'driver' component
+# For v6.1+: UART is in 'esp_driver_uart' component
+if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    set(DRIVER_REQUIRES driver esp_driver_uart esp_timer)
+else()
+    set(DRIVER_REQUIRES driver esp_timer)
+endif()
+
 idf_component_register(
     SRCS "ld2410c.c"
     INCLUDE_DIRS "include"
-    REQUIRES driver esp_driver_uart esp_timer
+    REQUIRES ${DRIVER_REQUIRES}
 )
 
 # Add comprehensive compiler warnings for code quality
