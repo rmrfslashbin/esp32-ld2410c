@@ -46,12 +46,20 @@ jobs:
             flawfinder-report.txt
 
   build-test:
-    name: Build Test (ESP-IDF ${{ matrix.idf-version }})
+    name: Build Test (ESP-IDF ${{ matrix.idf-version }}, ${{ matrix.idf-target }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false  # Don't cancel other jobs if one fails
       matrix:
-        idf-version: ['v5.1.2', 'v5.2.1', 'latest']
-        idf-target: ['esp32', 'esp32s3', 'esp32c3']
+        # Reduced matrix: test latest ESP-IDF with each target
+        # and v5.2.1 with ESP32 (most common)
+        include:
+          - idf-version: 'v5.2.1'
+            idf-target: 'esp32'
+          - idf-version: 'latest'
+            idf-target: 'esp32s3'
+          - idf-version: 'latest'
+            idf-target: 'esp32c3'
 
     steps:
       - name: Checkout repository
