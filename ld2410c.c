@@ -94,12 +94,6 @@ static esp_err_t send_command(uint8_t cmd, const uint8_t *value, uint8_t value_l
         return ESP_ERR_INVALID_SIZE;
     }
 
-    // Prevent integer overflow in length field
-    if (value_len > (UINT16_MAX - 2)) {
-        ESP_LOGE(TAG, "Command value too large: %d bytes", value_len);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
     // Header
     frame[pos++] = LD2410C_CMD_FRAME_HEADER_0;
     frame[pos++] = LD2410C_CMD_FRAME_HEADER_1;
@@ -107,9 +101,10 @@ static esp_err_t send_command(uint8_t cmd, const uint8_t *value, uint8_t value_l
     frame[pos++] = LD2410C_CMD_FRAME_HEADER_3;
 
     // Length (2 bytes for command + value length)
-    uint16_t len = 2 + value_len;
-    frame[pos++] = len & 0xFF;        // Low byte
-    frame[pos++] = (len >> 8) & 0xFF; // High byte
+    // Note: value_len is uint8_t (max 255), so total_len can't overflow uint16_t
+    uint16_t len = 2U + (uint16_t)value_len;
+    frame[pos++] = (uint8_t)(len & 0xFFU);        // Low byte
+    frame[pos++] = (uint8_t)((len >> 8) & 0xFFU); // High byte
 
     // Command word (little endian)
     frame[pos++] = cmd;
@@ -356,7 +351,7 @@ static void uart_rx_task(void *arg) {
         int len = uart_read_bytes(s_ld2410c.uart_num, data, LD2410C_UART_BUF_SIZE, pdMS_TO_TICKS(100));
 
         if (len > 0) {
-            total_bytes += len;
+            total_bytes += (uint32_t)len;
 
             // Process each byte
             for (int i = 0; i < len; i++) {
@@ -440,7 +435,7 @@ esp_err_t ld2410c_init(const ld2410c_config_t *config) {
 
     // Configure UART
     uart_config_t uart_config = {
-        .baud_rate = config->baud_rate,
+        .baud_rate = (int)config->baud_rate,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -632,8 +627,8 @@ esp_err_t ld2410c_set_max_distances_timeout(uint8_t max_move_gate,
     value[9] = 0x00;  value[10] = 0x00;  value[11] = 0x00;
 
     value[12] = 0x02;  value[13] = 0x00;  // No one duration word
-    value[14] = timeout_sec & 0xFF;
-    value[15] = (timeout_sec >> 8) & 0xFF;
+    value[14] = (uint8_t)(timeout_sec & 0xFFU);
+    value[15] = (uint8_t)((timeout_sec >> 8) & 0xFFU);
     value[16] = 0x00;  value[17] = 0x00;
 
     esp_err_t ret = set_config_mode(true);
