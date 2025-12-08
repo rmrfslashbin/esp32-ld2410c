@@ -106,8 +106,8 @@ jobs:
           project(ld2410c-test)
           EOF
 
-          # Copy component
-          cp -r . test-project/components/ld2410c
+          # Copy component (exclude test-project to avoid circular copy)
+          rsync -av --exclude='test-project' . test-project/components/ld2410c/
 
       - name: Install ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
