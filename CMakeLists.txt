@@ -1,8 +1,8 @@
-# ESP-IDF v6.1+ split UART driver into separate component
-# For v5.x: UART is in 'driver' component
-# For v6.1+: UART is in 'esp_driver_uart' component
+# ESP-IDF v6.1+ split drivers into separate components
+# For v5.x: UART and GPIO are in 'driver' component
+# For v6.1+: UART is in 'esp_driver_uart', GPIO is in 'esp_driver_gpio'
 if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
-    set(DRIVER_REQUIRES driver esp_driver_uart esp_timer)
+    set(DRIVER_REQUIRES driver esp_driver_uart esp_driver_gpio esp_timer)
 else()
     set(DRIVER_REQUIRES driver esp_timer)
 endif()

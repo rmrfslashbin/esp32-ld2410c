@@ -15,7 +15,10 @@
 #include <stdbool.h>
 #include "esp_err.h"
 #include "driver/uart.h"
-#include "driver/gpio.h"
+
+// ESP-IDF v6.1+ uses hal/gpio_types.h for GPIO constants
+// ESP-IDF v5.x uses driver/gpio.h
+#include "hal/gpio_types.h"
 
 #ifdef __cplusplus
 extern "C" {
