@@ -182,8 +182,8 @@ static esp_err_t send_command(uint8_t cmd, const uint8_t *value, uint8_t value_l
                 }
             }
 
-            // Check ACK status
-            if (s_ld2410c.ack_buffer[7] != 0x00) {
+            // Check ACK status (0x01 = success per ESPHome implementation)
+            if (s_ld2410c.ack_buffer[7] != 0x01) {
                 ESP_LOGW(TAG, "Command 0x%02X failed: status=0x%02X", cmd, s_ld2410c.ack_buffer[7]);
                 s_ld2410c.waiting_for_ack = false;
                 return ESP_FAIL;
@@ -317,7 +317,7 @@ static void parse_ack_frame(const uint8_t *buf, uint8_t len) {
     uint8_t cmd = buf[6];
     uint8_t status = buf[7];
 
-    if (status == 0x00) {
+    if (status == 0x01) {
         ESP_LOGD(TAG, "ACK for command 0x%02X: SUCCESS", cmd);
     } else {
         ESP_LOGW(TAG, "ACK for command 0x%02X: FAILED (status=0x%02X)", cmd, status);
@@ -332,75 +332,51 @@ static void parse_ack_frame(const uint8_t *buf, uint8_t len) {
 }
 
 /**
- * @brief Process one byte from UART stream
+ * @brief Process one byte from UART stream (ESPHome footer-based detection)
  *
- * State machine to detect frame boundaries and parse frames.
+ * This implements footer-based frame detection like ESPHome:
+ * - Accumulate bytes in circular buffer
+ * - Check if last 4 bytes match a known footer pattern
+ * - If match, parse the complete frame
+ * - Reset buffer for next frame
+ *
+ * This is more robust than header-based detection as it can resync
+ * if bytes are lost or we start reading mid-stream.
  */
 static void process_byte(uint8_t byte) {
-    if (!s_ld2410c.in_frame) {
-        // Look for frame header
-        if (s_ld2410c.buffer_pos == 0 &&
-            (byte == LD2410C_DATA_FRAME_HEADER_0 || byte == LD2410C_CMD_FRAME_HEADER_0)) {
-            s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
-        } else if (s_ld2410c.buffer_pos == 1 &&
-                   (byte == LD2410C_DATA_FRAME_HEADER_1 || byte == LD2410C_CMD_FRAME_HEADER_1)) {
-            s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
-        } else if (s_ld2410c.buffer_pos == 2 &&
-                   (byte == LD2410C_DATA_FRAME_HEADER_2 || byte == LD2410C_CMD_FRAME_HEADER_2)) {
-            s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
-        } else if (s_ld2410c.buffer_pos == 3 &&
-                   (byte == LD2410C_DATA_FRAME_HEADER_3 || byte == LD2410C_CMD_FRAME_HEADER_3)) {
-            s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
-            s_ld2410c.in_frame = true;
-
-            // Detect frame type
-            if (s_ld2410c.buffer[0] == LD2410C_DATA_FRAME_HEADER_0) {
-                s_ld2410c.frame_type = FRAME_TYPE_DATA;
-            } else {
-                s_ld2410c.frame_type = FRAME_TYPE_CMD_ACK;
-            }
-        } else {
-            s_ld2410c.buffer_pos = 0;  // Reset on mismatch
-        }
-    } else {
-        // Inside frame - collect bytes
-        if (s_ld2410c.buffer_pos >= LD2410C_MAX_FRAME_SIZE) {
-            ESP_LOGW(TAG, "Frame buffer overflow");
-            s_ld2410c.buffer_pos = 0;
-            s_ld2410c.in_frame = false;
-            return;
-        }
-
-        s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
-
-        // Check if we have length bytes (position 4 and 5)
-        if (s_ld2410c.buffer_pos >= 6) {
-            uint16_t data_len = two_byte_to_int(s_ld2410c.buffer[4], s_ld2410c.buffer[5]);
-            uint16_t total_len = 4 + 2 + data_len + 4;  // header + length + data + footer
-
-            // Sanity check
-            if (total_len > LD2410C_MAX_FRAME_SIZE) {
-                ESP_LOGW(TAG, "Invalid frame length: %d", data_len);
-                s_ld2410c.buffer_pos = 0;
-                s_ld2410c.in_frame = false;
-                return;
-            }
-
-            // Check if we have complete frame
-            if (s_ld2410c.buffer_pos >= total_len) {
-                // Parse frame based on type
-                if (s_ld2410c.frame_type == FRAME_TYPE_DATA) {
-                    parse_data_frame(s_ld2410c.buffer, s_ld2410c.buffer_pos);
-                } else {
-                    parse_ack_frame(s_ld2410c.buffer, s_ld2410c.buffer_pos);
-                }
-
-                // Reset for next frame
-                s_ld2410c.buffer_pos = 0;
-                s_ld2410c.in_frame = false;
-            }
-        }
+    // Buffer overflow protection
+    if (s_ld2410c.buffer_pos >= LD2410C_MAX_FRAME_SIZE - 1) {
+        ESP_LOGW(TAG, "Frame buffer overflow, resetting");
+        s_ld2410c.buffer_pos = 0;
+        return;
     }
+
+    // Accumulate byte
+    s_ld2410c.buffer[s_ld2410c.buffer_pos++] = byte;
+    s_ld2410c.buffer[s_ld2410c.buffer_pos] = 0;  // Null terminate for safety
+
+    // Need at least 4 bytes for footer check
+    if (s_ld2410c.buffer_pos < 4) {
+        return;
+    }
+
+    // Check last 4 bytes for DATA frame footer (F8 F7 F6 F5)
+    if (validate_footer(&s_ld2410c.buffer[s_ld2410c.buffer_pos - 4], true)) {
+        ESP_LOGV(TAG, "Detected DATA frame footer");
+        parse_data_frame(s_ld2410c.buffer, s_ld2410c.buffer_pos);
+        s_ld2410c.buffer_pos = 0;  // Reset for next frame
+        return;
+    }
+
+    // Check last 4 bytes for CMD/ACK frame footer (04 03 02 01)
+    if (validate_footer(&s_ld2410c.buffer[s_ld2410c.buffer_pos - 4], false)) {
+        ESP_LOGV(TAG, "Detected ACK frame footer");
+        parse_ack_frame(s_ld2410c.buffer, s_ld2410c.buffer_pos);
+        s_ld2410c.buffer_pos = 0;  // Reset for next frame
+        return;
+    }
+
+    // No footer match yet - continue accumulating
 }
 
 /**
@@ -418,12 +394,28 @@ static void uart_rx_task(void *arg) {
 
     uint32_t total_bytes = 0;
     uint32_t last_log_time = 0;
+    uint32_t data_frames_parsed = 0;
+    uint32_t ack_frames_parsed = 0;
 
     while (1) {
         int len = uart_read_bytes(s_ld2410c.uart_num, data, LD2410C_UART_BUF_SIZE, pdMS_TO_TICKS(100));
 
         if (len > 0) {
             total_bytes += (uint32_t)len;
+
+            // Debug: Log raw bytes if we're stuck (first 300 bytes only)
+            if (total_bytes < 300) {
+                ESP_LOGI(TAG, "RX %d bytes: %02X %02X %02X %02X %02X %02X %02X %02X...",
+                         len,
+                         len > 0 ? data[0] : 0,
+                         len > 1 ? data[1] : 0,
+                         len > 2 ? data[2] : 0,
+                         len > 3 ? data[3] : 0,
+                         len > 4 ? data[4] : 0,
+                         len > 5 ? data[5] : 0,
+                         len > 6 ? data[6] : 0,
+                         len > 7 ? data[7] : 0);
+            }
 
             // Process each byte
             for (int i = 0; i < len; i++) {
@@ -570,27 +562,58 @@ esp_err_t ld2410c_init(const ld2410c_config_t *config) {
         return ESP_FAIL;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(100));  // Wait for UART to stabilize
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for UART to stabilize and sensor to boot
 
-    // Initialize sensor: Enable config mode, then disable to start streaming
-    ESP_LOGI(TAG, "Sending initialization sequence...");
+    // ESPHome-style initialization: query sensor info then start streaming
+    // This serves dual purpose:
+    // 1. Verifies sensor is responding and awake
+    // 2. Logs diagnostic information
+    ESP_LOGI(TAG, "Sending ESPHome-style initialization sequence...");
 
     ret = set_config_mode(true);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to enable config mode (this may be normal if sensor is already streaming)");
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Config mode enabled - querying sensor info...");
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // Query firmware version
+        ld2410c_version_t version = {0};
+        if (ld2410c_query_version(&version) == ESP_OK) {
+            ESP_LOGI(TAG, "Firmware: V%d.%02d (Type %d, Code %08lX)",
+                     version.major, version.minor, version.type, version.code);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // Query MAC address
+        uint8_t mac[6] = {0};
+        if (ld2410c_query_mac(mac) == ESP_OK) {
+            ESP_LOGI(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // Query parameters
+        ld2410c_parameters_t params = {0};
+        if (ld2410c_query_parameters(&params) == ESP_OK) {
+            ESP_LOGI(TAG, "Config: Max move=%d, max still=%d, timeout=%ds",
+                     params.max_move_gate, params.max_still_gate, params.timeout_sec);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // Exit config mode to start data streaming
+        ESP_LOGI(TAG, "Exiting config mode - starting data stream...");
+        set_config_mode(false);
+    } else {
+        ESP_LOGW(TAG, "Config mode failed - sensor may already be streaming");
     }
 
-    vTaskDelay(pdMS_TO_TICKS(200));  // Wait for config mode
-
-    ret = set_config_mode(false);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to disable config mode");
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(200));  // Wait for streaming to start
+    vTaskDelay(pdMS_TO_TICKS(200));  // Give sensor time to start streaming
 
     s_ld2410c.initialized = true;
-    ESP_LOGI(TAG, "LD2410C driver initialized successfully");
+    ESP_LOGI(TAG, "LD2410C driver initialized (ESPHome-style)");
 
     return ESP_OK;
 }
